@@ -1,0 +1,19 @@
+[package]
+name = "bearings-proc"
+version = "0.0.0"
+authors = ["Michał 'Griwes' Dominiak <griwes@griwes.info>"]
+edition = "2018"
+license = "Apache-2.0"
+description = "Procedural macros for bearings, an asynchronous, transport-agnostic RPC library for two-way persistent connections."
+repository = "https://github.com/griwes/bearings"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0"
+syn = "1.0"
+quote = "1.0"
+
+[dev-dependencies]
+
