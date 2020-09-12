@@ -215,38 +215,41 @@ impl<T: serde::de::DeserializeOwned, U> Future for ReplyFuture<T, U> {
     type Output = Result<T, Box<dyn std::error::Error>>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
-        match self.state.awaiters.try_lock() {
-            Result::Ok(mut map) => match map.remove(&self.request_id) {
-                Option::Some(awaiter) => match awaiter.try_lock() {
-                    Result::Ok(awaiter) => match &*awaiter {
-                        Awaiter::Return(ret) => {
-                            println!("{}", ret.result);
-                            let parsed: Result<T, _> = serde_json::from_value(ret.result.clone());
-                            match parsed {
-                                Result::Ok(value) => Poll::Ready(Ok(value)),
-                                Result::Err(err) => {
-                                    println!("{}", err);
-                                    panic!("failed to parse the result in the response")
+        loop {
+            match self.state.awaiters.try_lock() {
+                Result::Ok(mut map) => match map.remove(&self.request_id) {
+                    Option::Some(awaiter) => match awaiter.try_lock() {
+                        Result::Ok(awaiter) => match &*awaiter {
+                            Awaiter::Return(ret) => {
+                                println!("{}", ret.result);
+                                let parsed: Result<T, _> =
+                                    serde_json::from_value(ret.result.clone());
+                                match parsed {
+                                    Result::Ok(value) => return Poll::Ready(Ok(value)),
+                                    Result::Err(err) => {
+                                        println!("{}", err);
+                                        panic!("failed to parse the result in the response")
+                                    }
                                 }
                             }
-                        }
 
-                        _ => {
-                            map.insert(
-                                self.request_id,
-                                Mutex::from(Awaiter::Waker(ctx.waker().clone())),
-                            );
-                            println!("{:?}", map);
-                            return Poll::Pending;
-                        }
+                            _ => {
+                                map.insert(
+                                    self.request_id,
+                                    Mutex::from(Awaiter::Waker(ctx.waker().clone())),
+                                );
+                                println!("{:?}", map);
+                                return Poll::Pending;
+                            }
+                        },
+                        Result::Err(_) => panic!("how did this happen?"),
                     },
-                    Result::Err(_) => Poll::Pending,
+
+                    Option::None => panic!("tried to await on a call result of a not issued call"),
                 },
 
-                Option::None => panic!("tried to await on a call result of a not issued call"),
-            },
-
-            Result::Err(_) => Poll::Pending,
+                Result::Err(_) => continue,
+            }
         }
     }
 }
