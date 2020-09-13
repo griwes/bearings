@@ -3,21 +3,34 @@ extern crate proc_macro;
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    parse_macro_input, Fields, FnArg, Ident, ItemStruct, ItemTrait, Pat, ReturnType, TraitItem,
-    Type,
+    parse_macro_input, Fields, FnArg, Ident, ImplItem, ItemImpl, ItemStruct, ItemTrait, Pat,
+    ReturnType, TraitItem, Type,
 };
 
 #[proc_macro_attribute]
-pub fn class(_attr: TokenStream, defn: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(defn as ItemTrait);
+pub fn interface(attr: TokenStream, defn: TokenStream) -> TokenStream {
+    let mut input = parse_macro_input!(defn as ItemTrait);
+    let user_error = parse_macro_input!(attr as Type);
 
     let mut client_functions = quote! {};
     let mut dispatcher_cases = quote! {};
 
-    for item in &input.items {
-        match item {
-            TraitItem::Method(method) => {
-                let signature = &method.sig;
+    for mut item in &mut input.items {
+        match &mut item {
+            TraitItem::Method(ref mut method) => {
+                let signature = &mut method.sig;
+                let original_result = &signature.output;
+                match original_result {
+                    ReturnType::Type(_, original_result) => {
+                        let replacement = TokenStream::from(
+                            quote! { -> ::bearings::Result<#original_result, #user_error> },
+                        );
+                        signature.output = parse_macro_input!(replacement as ReturnType);
+                    }
+                    _ => {
+                        panic!("can't handle a function with default return type in a class");
+                    }
+                }
 
                 let mut arguments = quote! {};
                 let mut argument_tuple = quote! {};
@@ -69,7 +82,7 @@ pub fn class(_attr: TokenStream, defn: TokenStream) -> TokenStream {
                             id
                         };
 
-                        let call = ::serde_json::to_string(&::bearings::Message::<_>::Call(::bearings::FunctionCall{
+                        let call = ::serde_json::to_string(&::bearings::Message::<_, #user_error>::Call(::bearings::FunctionCall{
                             id: id,
                             uuid: self.uuid.clone(),
                             member: self.member.to_string(),
@@ -92,7 +105,8 @@ pub fn class(_attr: TokenStream, defn: TokenStream) -> TokenStream {
 
                         ::bearings::ReplyFuture::<
                             <#return_type as ::std::iter::IntoIterator>::Item,
-                            T
+                            T,
+                            #user_error
                         >::new(self.state.clone(), id).await
                     }
                 });
@@ -100,11 +114,11 @@ pub fn class(_attr: TokenStream, defn: TokenStream) -> TokenStream {
                 dispatcher_cases.extend(quote! {
                     stringify!(#name) => {
                         let arguments: (#argument_tuple) = ::serde_json::from_value(call.arguments)?;
-                        Ok(::bearings::Message::<()>::Return(
+                        Ok(::bearings::Message::<(), #user_error>::Return(
                             ::bearings::ReturnValue{
                                 id: call.id,
                                 result: ::serde_json::value::Value::from({
-                                    let result = object.lock().await;
+                                    let mut result = object.lock().await;
                                     let result = result.#name(#argument_expansion);
                                     result.await?
                                 })
@@ -120,6 +134,7 @@ pub fn class(_attr: TokenStream, defn: TokenStream) -> TokenStream {
     }
 
     let name = &input.ident;
+    let error_name = syn::Ident::new(&format!("{}Error", name), syn::export::Span::call_site());
     let client_name = syn::Ident::new(&format!("{}Client", name), syn::export::Span::call_site());
     let dispatcher_name = syn::Ident::new(
         &format!("{}Dispatcher", name),
@@ -137,7 +152,7 @@ pub fn class(_attr: TokenStream, defn: TokenStream) -> TokenStream {
             async fn invoke_method<'a>(
                 object: &::tokio::sync::Mutex<Box<dyn #name + Send + 'a>>,
                 call: ::bearings::FunctionCall<serde_json::value::Value>,
-            ) -> Result<::bearings::Message<()>, Box<dyn std::error::Error>> {
+            ) -> ::bearings::Result<::bearings::Message<(), #user_error>, #user_error> {
                 match &call.method[..] {
                     #dispatcher_cases
 
@@ -151,13 +166,15 @@ pub fn class(_attr: TokenStream, defn: TokenStream) -> TokenStream {
         struct #client_name<T: Send + ::tokio::io::AsyncRead + ::tokio::io::AsyncWrite> {
             uuid: ::uuid::Uuid,
             member: &'static str,
-            state: ::bearings::StatePtr<T>,
+            state: ::bearings::StatePtr<T, #user_error>,
         }
 
         #[::bearings::async_trait]
         impl<T: Send + Unpin + ::tokio::io::AsyncRead + ::tokio::io::AsyncWrite> #name for #client_name<T> {
             #client_functions
         }
+
+        type #error_name = #user_error;
     };
 
     println!("{}", expanded);
@@ -166,8 +183,46 @@ pub fn class(_attr: TokenStream, defn: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
-pub fn object(_attr: TokenStream, defn: TokenStream) -> TokenStream {
+pub fn class(attr: TokenStream, defn: TokenStream) -> TokenStream {
+    let mut input = parse_macro_input!(defn as ItemImpl);
+    let user_error = parse_macro_input!(attr as Type);
+
+    for item in &mut input.items {
+        match item {
+            ImplItem::Method(ref mut method) => {
+                let signature = &mut method.sig;
+                let original_result = &signature.output;
+                match original_result {
+                    ReturnType::Type(_, original_result) => {
+                        let replacement = TokenStream::from(
+                            quote! { -> ::bearings::Result<#original_result, #user_error> },
+                        );
+                        signature.output = parse_macro_input!(replacement as ReturnType);
+                    }
+                    _ => {
+                        panic!("can't handle a function with default return type in a class");
+                    }
+                }
+            }
+
+            _ => panic!("unsupported class element"),
+        }
+    }
+
+    let expanded = quote! {
+        #[::bearings::async_trait]
+        #input
+    };
+
+    println!("{}", expanded);
+
+    TokenStream::from(expanded)
+}
+
+#[proc_macro_attribute]
+pub fn object(attr: TokenStream, defn: TokenStream) -> TokenStream {
     let input = parse_macro_input!(defn as ItemStruct);
+    let user_error = parse_macro_input!(attr as Type);
 
     let mut fields = quote!();
     let mut parameters = quote!();
@@ -246,12 +301,17 @@ pub fn object(_attr: TokenStream, defn: TokenStream) -> TokenStream {
     let name = &input.ident;
     let expanded = quote! {
         struct #name<'a> {
+            __: std::marker::PhantomData<&'a ()>,
+
             #fields
         }
 
         impl<'a> #name<'a> {
             pub fn new<#parameters>(#arguments) -> Self {
-                Self{ #init }
+                Self{
+                    __: <_>::default(),
+                    #init
+                }
             }
 
             fn uuid() -> ::uuid::Uuid {
@@ -260,7 +320,7 @@ pub fn object(_attr: TokenStream, defn: TokenStream) -> TokenStream {
         }
 
         #[::bearings::async_trait]
-        impl<'a> ::bearings::Object for #name<'a> {
+        impl<'a> ::bearings::Object<#user_error> for #name<'a> {
             fn uuid() -> ::uuid::Uuid {
                 Self::uuid()
             }
@@ -268,7 +328,7 @@ pub fn object(_attr: TokenStream, defn: TokenStream) -> TokenStream {
             async fn invoke(
                 &self,
                 call: ::bearings::FunctionCall<::serde_json::value::Value>,
-            ) -> Result<::bearings::Message<()>, Box<dyn std::error::Error>> {
+            ) -> ::bearings::Result<::bearings::Message<(), #user_error>, #user_error> {
                 assert_eq!(Self::uuid(), call.uuid);
 
                 match &call.member[..] {
@@ -279,12 +339,13 @@ pub fn object(_attr: TokenStream, defn: TokenStream) -> TokenStream {
             }
         }
 
-        impl<'a> ::bearings::ObjectClient<'a> for #name<'a> {
+        impl<'a> ::bearings::ObjectClient<'a, #user_error> for #name<'a> {
             fn build<T: 'a + Send + Unpin + ::tokio::io::AsyncRead + ::tokio::io::AsyncWrite>(
-                state: ::bearings::StatePtr<T>
+                state: ::bearings::StatePtr<T, #user_error>
             ) -> Self {
                 let uuid = Self::uuid();
                 Self {
+                    __: <_>::default(),
                     #client_init
                 }
             }

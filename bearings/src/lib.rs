@@ -1,5 +1,6 @@
 extern crate proc_macro;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use tokio::io::{
@@ -18,11 +19,16 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 pub use async_trait::async_trait;
+pub use bearings_proc::{class, interface, object};
 
-pub type StatePtr<T> = Arc<ServiceState<T>>;
+pub type StatePtr<T, E> = Arc<ServiceState<T, E>>;
+
+mod error;
+use error::Error::*;
+pub use error::*;
 
 #[async_trait]
-pub trait Object {
+pub trait Object<E: std::fmt::Debug + Serialize> {
     fn uuid() -> Uuid
     where
         Self: Sized;
@@ -30,29 +36,30 @@ pub trait Object {
     async fn invoke(
         &self,
         call: FunctionCall<serde_json::value::Value>,
-    ) -> Result<Message<()>, Box<dyn std::error::Error>>;
+    ) -> Result<Message<(), E>, E>;
 }
 
-pub trait ObjectClient<'a> {
-    fn build<T: 'a + Send + Unpin + AsyncRead + AsyncWrite>(state: StatePtr<T>) -> Self;
+pub trait ObjectClient<'a, E: std::fmt::Debug + Serialize> {
+    fn build<T: 'a + Send + Unpin + AsyncRead + AsyncWrite>(state: StatePtr<T, E>) -> Self;
 }
 
 #[derive(Debug)]
-pub enum Awaiter {
+pub enum Awaiter<E: std::fmt::Debug + Serialize> {
     Empty,
     Waker(Waker),
     Return(ReturnValue<serde_json::value::Value>),
+    Error(ErrorResult<E>),
 }
 
-pub struct ServiceState<T> {
+pub struct ServiceState<T, E: std::fmt::Debug + Serialize> {
     pub r: Mutex<BufReader<ReadHalf<T>>>,
     pub w: Mutex<BufWriter<WriteHalf<T>>>,
     pub id: Mutex<u64>,
-    objects: Mutex<HashMap<Uuid, Mutex<Box<dyn Object + Send>>>>,
-    pub awaiters: Mutex<HashMap<u64, Mutex<Awaiter>>>,
+    objects: Mutex<HashMap<Uuid, Mutex<Box<dyn Object<E> + Send>>>>,
+    pub awaiters: Mutex<HashMap<u64, Mutex<Awaiter<E>>>>,
 }
 
-impl<T: AsyncRead + AsyncWrite> ServiceState<T> {
+impl<T: AsyncRead + AsyncWrite, E: std::fmt::Debug + Serialize> ServiceState<T, E> {
     pub fn new(conn: T) -> Self {
         let (r, w) = tokio::io::split(conn);
         return Self {
@@ -65,12 +72,12 @@ impl<T: AsyncRead + AsyncWrite> ServiceState<T> {
     }
 }
 
-pub struct Service<T: AsyncRead + AsyncWrite> {
-    state: StatePtr<T>,
+pub struct Service<T: AsyncRead + AsyncWrite, E: std::fmt::Debug + Serialize> {
+    state: StatePtr<T, E>,
 }
 
-async fn launch<T: AsyncRead + AsyncWrite>(
-    state: StatePtr<T>,
+async fn launch<T: AsyncRead + AsyncWrite, E: std::fmt::Debug + Serialize>(
+    state: StatePtr<T, E>,
     call: FunctionCall<serde_json::value::Value>,
 ) -> () {
     let mut objects = state.objects.lock().await;
@@ -78,10 +85,19 @@ async fn launch<T: AsyncRead + AsyncWrite>(
 
     match objects.get_mut(&call.uuid) {
         Some(object) => {
+            let id = call.id;
             let result = object.lock().await;
             let result = result.invoke(call);
-            let result = result.await.unwrap();
-            let result = serde_json::to_string(&result).unwrap();
+            let result = result.await;
+
+            let result = match result {
+                Ok(message) => serde_json::to_string(&message).unwrap(),
+                Err(error) => serde_json::to_string(&Message::<(), E>::Error(ErrorResult {
+                    id: id,
+                    error: error,
+                }))
+                .unwrap(),
+            };
 
             let mut w = state.w.lock().await;
             w.write_all(format!("{}\0", result).as_bytes())
@@ -93,27 +109,33 @@ async fn launch<T: AsyncRead + AsyncWrite>(
     }
 }
 
-impl<T: 'static + AsyncRead + AsyncWrite + Unpin + Send> Service<T> {
+impl<
+        T: 'static + AsyncRead + AsyncWrite + Unpin + Send,
+        E: 'static + std::fmt::Debug + Serialize + DeserializeOwned + Send,
+    > Service<T, E>
+{
     pub fn new(conn: T) -> Self {
         Self {
             state: Arc::new(ServiceState::new(conn)),
         }
     }
 
-    pub fn controller(&self) -> Controller<T> {
+    pub fn controller(&self) -> Controller<T, E> {
         Controller {
             state: self.state.clone(),
         }
     }
 
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(self) -> Result<(), E> {
         let mut buf = Vec::new();
         let state = self.state.clone();
 
         loop {
+            buf.clear();
             state.r.lock().await.read_until(b'\0', &mut buf).await?;
             buf.pop();
-            let message: Message<serde_json::value::Value> = serde_json::from_reader(&*buf)?;
+            println!("{:?}", std::str::from_utf8(&*buf));
+            let message: Message<serde_json::value::Value, E> = serde_json::from_reader(&*buf)?;
             println!("{:?}", message);
 
             match message {
@@ -137,6 +159,26 @@ impl<T: 'static + AsyncRead + AsyncWrite + Unpin + Send> Service<T> {
                         _ => (),
                     }
                 }
+                Message::Error(err) => {
+                    let mut map = self.state.awaiters.lock().await;
+                    println!("{:?}", map);
+                    let awaiter = match map.remove(&err.id) {
+                        Option::None => panic!(
+                            "received a reply to a call that was not issued, or one that has already been replied to"
+                        ),
+                        Option::Some(awaiter) => awaiter,
+                    };
+                    let awaiter = awaiter.lock().await;
+
+                    map.insert(err.id, Mutex::from(Awaiter::Error(err)));
+
+                    match &*awaiter {
+                        Awaiter::Waker(waker) => {
+                            waker.wake_by_ref();
+                        }
+                        _ => (),
+                    }
+                }
                 Message::Call(call) => {
                     let state = self.state.clone();
                     tokio::spawn(launch(state, call));
@@ -146,28 +188,32 @@ impl<T: 'static + AsyncRead + AsyncWrite + Unpin + Send> Service<T> {
     }
 }
 
-unsafe impl<T: AsyncRead + AsyncWrite> Send for Service<T> {}
+unsafe impl<T: AsyncRead + AsyncWrite, E: std::fmt::Debug + Serialize> Send for Service<T, E> {}
 
-pub struct Controller<T: Send> {
-    state: StatePtr<T>,
+pub struct Controller<T: Send, E: std::fmt::Debug + Serialize> {
+    state: StatePtr<T, E>,
 }
 
-impl<'a, T: 'a + Send + Unpin + AsyncRead + AsyncWrite> Controller<T> {
-    pub async fn add_object<U: Object + Send + 'static>(
-        &self,
-        object: U,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.state.objects.lock().await.insert(
-            U::uuid(),
-            Mutex::from(Box::new(object) as Box<dyn Object + Send>),
+impl<'a, T: 'a + Send + Unpin + AsyncRead + AsyncWrite, E: std::fmt::Debug + Serialize>
+    Controller<T, E>
+{
+    pub async fn add_object<U: Object<E> + Send + 'static>(&self, object: U) -> Result<(), E> {
+        let uuid = U::uuid();
+        let mut objects = self.state.objects.lock().await;
+
+        if objects.contains_key(&uuid) {
+            return Err(UuidAlreadyInUse);
+        }
+
+        objects.insert(
+            uuid,
+            Mutex::from(Box::new(object) as Box<dyn Object<E> + Send>),
         );
 
         Ok(())
     }
 
-    pub async fn connect<U: Object + ObjectClient<'a>>(
-        &self,
-    ) -> Result<U, Box<dyn std::error::Error>> {
+    pub async fn connect<U: Object<E> + ObjectClient<'a, E>>(&self) -> Result<U, E> {
         Ok(U::build(self.state.clone()))
     }
 }
@@ -188,21 +234,28 @@ pub struct ReturnValue<T: Serialize> {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum Message<T: Serialize> {
-    Call(FunctionCall<T>),
-    Return(ReturnValue<serde_json::value::Value>),
+pub struct ErrorResult<E: std::fmt::Debug + Serialize> {
+    pub id: u64,
+    pub error: Error<E>,
 }
 
-pub struct ReplyFuture<T: serde::de::DeserializeOwned, U> {
-    state: StatePtr<U>,
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Message<T: Serialize, E: std::fmt::Debug + Serialize> {
+    Call(FunctionCall<T>),
+    Return(ReturnValue<serde_json::value::Value>),
+    Error(ErrorResult<E>),
+}
+
+pub struct ReplyFuture<T: DeserializeOwned, U, E: std::fmt::Debug + Serialize> {
+    state: StatePtr<U, E>,
     request_id: u64,
     __: PhantomData<T>,
 }
 
-unsafe impl<T: serde::de::DeserializeOwned, U> Send for ReplyFuture<T, U> {}
+unsafe impl<T: DeserializeOwned, U, E: std::fmt::Debug + Serialize> Send for ReplyFuture<T, U, E> {}
 
-impl<T: serde::de::DeserializeOwned, U> ReplyFuture<T, U> {
-    pub fn new(state: StatePtr<U>, request_id: u64) -> Self {
+impl<T: DeserializeOwned, U, E: std::fmt::Debug + Serialize> ReplyFuture<T, U, E> {
+    pub fn new(state: StatePtr<U, E>, request_id: u64) -> Self {
         ReplyFuture {
             state: state,
             request_id: request_id,
@@ -211,44 +264,46 @@ impl<T: serde::de::DeserializeOwned, U> ReplyFuture<T, U> {
     }
 }
 
-impl<T: serde::de::DeserializeOwned, U> Future for ReplyFuture<T, U> {
-    type Output = Result<T, Box<dyn std::error::Error>>;
+impl<T: DeserializeOwned, U, E: std::fmt::Debug + Serialize> Future for ReplyFuture<T, U, E> {
+    type Output = Result<T, E>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
         loop {
             match self.state.awaiters.try_lock() {
-                Result::Ok(mut map) => match map.remove(&self.request_id) {
-                    Option::Some(awaiter) => match awaiter.try_lock() {
-                        Result::Ok(awaiter) => match &*awaiter {
-                            Awaiter::Return(ret) => {
-                                println!("{}", ret.result);
-                                let parsed: Result<T, _> =
-                                    serde_json::from_value(ret.result.clone());
-                                match parsed {
-                                    Result::Ok(value) => return Poll::Ready(Ok(value)),
-                                    Result::Err(err) => {
-                                        println!("{}", err);
-                                        panic!("failed to parse the result in the response")
-                                    }
+                Ok(mut map) => match map.remove(&self.request_id) {
+                    Some(awaiter) => match awaiter.into_inner() {
+                        Awaiter::Return(ret) => {
+                            println!("{:?}", ret.result);
+                            let parsed: std::result::Result<T, _> =
+                                serde_json::from_value(ret.result.clone());
+                            match parsed {
+                                Ok(value) => return Poll::Ready(Ok(value)),
+                                Err(err) => {
+                                    println!("{}", err);
+                                    panic!("failed to parse the result in the response")
                                 }
                             }
+                        }
 
-                            _ => {
-                                map.insert(
-                                    self.request_id,
-                                    Mutex::from(Awaiter::Waker(ctx.waker().clone())),
-                                );
-                                println!("{:?}", map);
-                                return Poll::Pending;
-                            }
-                        },
-                        Result::Err(_) => panic!("how did this happen?"),
+                        Awaiter::Error(err) => {
+                            println!("{:?}", err.error);
+                            return Poll::Ready(Err(err.error));
+                        }
+
+                        _ => {
+                            map.insert(
+                                self.request_id,
+                                Mutex::from(Awaiter::Waker(ctx.waker().clone())),
+                            );
+                            println!("{:?}", map);
+                            return Poll::Pending;
+                        }
                     },
 
-                    Option::None => panic!("tried to await on a call result of a not issued call"),
+                    None => panic!("tried to await on a call result of a not issued call"),
                 },
 
-                Result::Err(_) => continue,
+                Err(_) => continue,
             }
         }
     }

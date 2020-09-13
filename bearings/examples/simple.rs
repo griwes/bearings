@@ -1,30 +1,29 @@
-use bearings::{async_trait, Service};
-use bearings_proc::{class, object};
+use bearings::{class, interface, object, Result, Service};
 
 use tokio::io::duplex;
 
-#[class]
+#[interface(())]
 trait Performer {
-    async fn perform(&self, string: String) -> Result<String, Box<dyn std::error::Error>>;
+    async fn perform(&self, string: String) -> String;
 }
 
 #[derive(Default)]
 struct Reverser;
 
-#[async_trait]
+#[class(())]
 impl Performer for Reverser {
-    async fn perform(&self, string: String) -> Result<String, Box<dyn std::error::Error>> {
+    async fn perform(&self, string: String) -> String {
         Ok(string.chars().rev().collect())
     }
 }
 
-#[object]
+#[object(())]
 struct SimpleExample {
     performer: Performer,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), ()> {
     let (server, client) = duplex(1024);
 
     let server = Service::new(server);

@@ -15,6 +15,7 @@ tokio = { git = "https://github.com/tokio-rs/tokio", features = ["full"] }
 uuid = { version = "0.8", features = ["v5", "serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_with = "1.4"
 
 [dev-dependencies]
 
