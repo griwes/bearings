@@ -155,10 +155,7 @@ pub fn interface(attr: TokenStream, defn: TokenStream) -> TokenStream {
             ) -> ::bearings::Result<::bearings::Message<(), #user_error>, #user_error> {
                 match &call.method[..] {
                     #dispatcher_cases
-
-                    _ => {
-                        panic!("an unknown method requested");
-                    }
+                    _ => Err(::bearings::Error::UnknownMethod(call.member, call.method))
                 }
             }
         }
@@ -333,8 +330,7 @@ pub fn object(attr: TokenStream, defn: TokenStream) -> TokenStream {
 
                 match &call.member[..] {
                     #member_dispatch
-
-                    _ => panic!("a method of an unknown member requested")
+                    _ => Err(::bearings::Error::UnknownMember(call.member))
                 }
             }
         }

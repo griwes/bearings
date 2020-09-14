@@ -83,30 +83,31 @@ async fn launch<T: AsyncRead + AsyncWrite, E: std::fmt::Debug + Serialize>(
     let mut objects = state.objects.lock().await;
     println!("{:?}", objects.keys());
 
-    match objects.get_mut(&call.uuid) {
+    let id = call.id;
+
+    let result = match objects.get_mut(&call.uuid) {
         Some(object) => {
-            let id = call.id;
             let result = object.lock().await;
             let result = result.invoke(call);
-            let result = result.await;
-
-            let result = match result {
-                Ok(message) => serde_json::to_string(&message).unwrap(),
-                Err(error) => serde_json::to_string(&Message::<(), E>::Error(ErrorResult {
-                    id: id,
-                    error: error,
-                }))
-                .unwrap(),
-            };
-
-            let mut w = state.w.lock().await;
-            w.write_all(format!("{}\0", result).as_bytes())
-                .await
-                .unwrap();
-            w.flush().await.unwrap();
+            result.await
         }
-        None => panic!("attempted to invoke a function of an object that is not registered"),
-    }
+        None => Err(UnknownObject(call.uuid)),
+    };
+
+    let result = match result {
+        Ok(message) => serde_json::to_string(&message).unwrap(),
+        Err(error) => serde_json::to_string(&Message::<(), E>::Error(ErrorResult {
+            id: id,
+            error: error,
+        }))
+        .unwrap(),
+    };
+
+    let mut w = state.w.lock().await;
+    w.write_all(format!("{}\0", result).as_bytes())
+        .await
+        .unwrap();
+    w.flush().await.unwrap();
 }
 
 impl<
@@ -148,11 +149,11 @@ impl<
                         ),
                         Option::Some(awaiter) => awaiter,
                     };
-                    let awaiter = awaiter.lock().await;
+                    let awaiter = awaiter.into_inner();
 
                     map.insert(ret.id, Mutex::from(Awaiter::Return(ret)));
 
-                    match &*awaiter {
+                    match awaiter {
                         Awaiter::Waker(waker) => {
                             waker.wake_by_ref();
                         }
@@ -168,11 +169,11 @@ impl<
                         ),
                         Option::Some(awaiter) => awaiter,
                     };
-                    let awaiter = awaiter.lock().await;
+                    let awaiter = awaiter.into_inner();
 
                     map.insert(err.id, Mutex::from(Awaiter::Error(err)));
 
-                    match &*awaiter {
+                    match awaiter {
                         Awaiter::Waker(waker) => {
                             waker.wake_by_ref();
                         }
@@ -278,10 +279,7 @@ impl<T: DeserializeOwned, U, E: std::fmt::Debug + Serialize> Future for ReplyFut
                                 serde_json::from_value(ret.result.clone());
                             match parsed {
                                 Ok(value) => return Poll::Ready(Ok(value)),
-                                Err(err) => {
-                                    println!("{}", err);
-                                    panic!("failed to parse the result in the response")
-                                }
+                                Err(err) => return Poll::Ready(Err(Error::from(err))),
                             }
                         }
 

@@ -15,6 +15,10 @@ fn never_invoke<T, U>(_: U) -> T {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Error<T: std::fmt::Debug> {
     UuidAlreadyInUse,
+    UnknownObject(uuid::Uuid),
+    UnknownMember(String),
+    UnknownMethod(String, String),
+    UnknownCall,
 
     #[serde(
         serialize_with = "serde_with::rust::display_fromstr::serialize",
@@ -49,7 +53,15 @@ use Error::*;
 impl<T: std::fmt::Debug + std::fmt::Display> std::fmt::Display for Error<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match *self {
-            UuidAlreadyInUse => write!(f, "the service already serves an object with the same uuid as the object you tried to add"),
+            UuidAlreadyInUse => write!(f,
+                "the service already serves an object with the same uuid as the object you tried to add"
+            ),
+            UnknownObject(ref uuid) => write!(f, "requested a method of a member of an unknown object: {}", uuid),
+            UnknownMember(ref member) => write!(f, "requested a method of an unknown object member: {}", member),
+            UnknownMethod(ref member, ref method) => write!(f, "requested an unknown method: {}.{}", member, method),
+            UnknownCall => write!(f,
+                "attempted to await on a result of a call that has not been issued yet, or one that has already been awaited on"
+            ),
 
             IoError(ref err) => err.fmt(f),
             JsonError(ref err) => err.fmt(f),
@@ -66,6 +78,10 @@ impl<T: 'static + std::fmt::Debug + std::fmt::Display + std::error::Error> std::
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match *self {
             UuidAlreadyInUse => None,
+            UnknownObject(_) => None,
+            UnknownMember(_) => None,
+            UnknownMethod(_, _) => None,
+            UnknownCall => None,
 
             IoError(ref err) => Some(err),
             JsonError(ref err) => Some(err),
